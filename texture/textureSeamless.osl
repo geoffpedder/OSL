@@ -1,0 +1,93 @@
+/*
+*   textureSeamless.osl by Geoff Pedder
+*   ported from GLSL example by Fabrice Neyret https://www.shadertoy.com/view/MdyfDV
+*   from paper https://hal.inria.fr/hal-01824773
+*/
+
+float fract( float input ){
+    return input - floor( input );
+}
+
+color ctex ( string filename, float texScale, vector uv, vector cell, vector offsets, color m ){
+	vector randcell = noise( "hash", cell + offsets );
+	return texture( filename, ( uv[0] / texScale ) - randcell[0], ( uv[1] / texScale ) - randcell[1], "wrap", "periodic") - m;
+}
+
+shader textureSeamless
+[[
+    string help = "Creates endless non-repeating seamless texture using hexagon tiling method"
+]]
+(
+
+string filename = "" [[
+    string label = "Filename",
+    string widget = "filename",
+    string help = "The texture to use, it should be converted to linear space and mip-mapped",
+    int connectable = 0
+]],
+
+float scale = 10 [[
+    string label = "Grid Repeats",
+    string help = "The scaling of the tiling grid",
+    int connectable = 0
+]],
+
+float texScale = 4 [[
+    string label = "Texture Scale",
+    string help = "The scaling of the texture inside the grid cells",
+    int connectable = 0
+]],
+
+int showGrid = 0 [[
+    string label = "Display Grid",
+    string widget = "checkBox",
+    string help = "Shows the tiling grid boundary, useful for visualizing the overall scaling",
+    int connectable = 0
+]],
+
+point inManifold = 0 [[
+    string label = "Input Manifold",
+    string widget = "null",
+    string help = "if connected, it will override with connected uv",
+]],
+
+output color result = 0,
+)
+
+{
+    // construct matrix for skew
+    matrix M0 = matrix(1);
+    M0[1][0] = -0.577353;
+    M0[1][1] = 1.1547077;
+
+
+    // create cell uv's
+    point _uv = point( u, v, 0 ) * scale;
+    if ( isconnected( inManifold ) ) _uv = inManifold * scale;
+    point _F = transform( M0, _uv );
+    vector h = vector(  fract( _F[0] ), fract( _F[1] ), 0 );
+    h[2] = 1 - h[0] - h[1];
+
+    // cell id
+    vector _I = floor( _F );
+ 
+    color m = texture( filename, _uv[0], _uv[1], "width", 99, "wrap", "periodic" );
+
+    vector W;
+    if ( h[2] > 0 ) result = ( W[0] = h[2] ) * ctex( filename, texScale, _uv, _I, point( 0, 0, 0 ), m )
+                           + ( W[1] = h[1] ) * ctex( filename, texScale, _uv, _I, point( 0, 1, 0 ), m )
+                           + ( W[2] = h[0] ) * ctex( filename, texScale, _uv, _I, point( 1, 0, 0 ), m );
+    else result = ( W[0] = -h[2] ) * ctex( filename, texScale, _uv, _I, point( 1, 1, 0 ), m )
+                + ( W[1] = 1.0 - h[1] ) * ctex( filename, texScale, _uv, _I, point( 1, 0, 0 ), m )
+                + ( W[2] = 1.0 - h[0] ) * ctex( filename, texScale, _uv, _I, point( 0, 1, 0 ), m );
+
+    // contrast preservation
+    result = m + result / length( W );
+    result = clamp( result, 0, 1 );
+
+    // display grid for debug and scaling feedback
+    if ( showGrid ) {
+        float fw = filterwidth( _uv[1] ) * 2.0;
+        result= mix( result, color( 1, 0, 0 ), 1 - smoothstep( fw, -fw, min( W[0], min( W[1], W[2] ) ) ) );
+    }
+}
