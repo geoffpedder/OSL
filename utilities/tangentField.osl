@@ -1,0 +1,93 @@
+/*
+*   tangentField.osl by Geoff Pedder
+*   rotates the surface tangent about the shading normal, typically to drive the
+*   anisotropy direction of a specular lobe (connect result to standard_surface tangent)
+*/
+
+shader tangentField
+[[
+    string help = "Rotates the surface tangent about the normal, from a rotation value or a vector map"
+]]
+(
+
+float inputRotation = 0 [[
+    string label = "Input Rotation",
+    string help = "Rotation as 0 to 1 for 0 to 360 degrees. In auto mode it is used whenever it is connected"
+]],
+
+color inputVector = color( 1, 0.5, 0 ) [[
+    string label = "Input Vector",
+    string help = "Red and green are the x and y of the direction in tangent space, blue is ignored. Vector maps filter better than rotation maps, which wrap from 1 back to 0"
+]],
+
+string inputMode = "auto" [[
+    string label = "Input Mode",
+    string widget = "popup",
+    string options = "auto|rotation|vector",
+    string help = "auto uses Input Rotation when it is connected, otherwise Input Vector",
+    int connectable = 0
+]],
+
+float rotationOffset = 0 [[
+    string label = "Rotation Offset",
+    string help = "Extra rotation in degrees, added to the input",
+    float min = -180,
+    float max = 180
+]],
+
+float rotationRange = 1 [[
+    string label = "Rotation Range",
+    string help = "Scales the input rotation, 1 maps the full input to 360 degrees",
+    float min = 0,
+    float max = 2,
+    int connectable = 0
+]],
+
+int centeredVectors = 1 [[
+    string label = "Centered Vectors",
+    string widget = "checkBox",
+    string help = "Input Vector is stored as 0 to 1 with 0.5 meaning zero, as in most flow maps",
+    int connectable = 0
+]],
+
+vector inTangent = dPdu [[
+    string label = "Input Tangent",
+    string help = "The tangent to rotate, defaults to the surface u direction"
+]],
+
+output vector result = 0,
+output float resultX = 0,
+output float resultY = 0,
+output float resultZ = 0,
+)
+
+{
+    // keep the starting tangent perpendicular to the shading normal, so bump and
+    // normal maps don't tilt the field out of the surface
+    vector Nn = normalize( N );
+    vector T = inTangent - dot( inTangent, Nn ) * Nn;
+    if ( length( T ) < 1e-6 ) T = cross( Nn, abs( Nn[1] ) < 0.99 ? vector( 0, 1, 0 ) : vector( 1, 0, 0 ) );
+    T = normalize( T );
+
+    int useRotation = inputMode == "rotation" || ( inputMode == "auto" && isconnected( inputRotation ) );
+
+    // angle from the rotation value or the direction of the vector
+    float angle = radians( rotationOffset );
+    if ( useRotation ) {
+        angle += inputRotation * M_2PI * rotationRange;
+    }
+    else {
+        float x = inputVector[0];
+        float y = inputVector[1];
+        if ( centeredVectors ) {
+            x -= 0.5;
+            y -= 0.5;
+        }
+        if ( x != 0 || y != 0 ) angle += atan2( y, x ) * rotationRange;
+    }
+
+    result = normalize( vector( rotate( point( T ), angle, point( 0 ), point( Nn ) ) ) );
+    resultX = result[0];
+    resultY = result[1];
+    resultZ = result[2];
+}
