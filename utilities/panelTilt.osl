@@ -1,0 +1,73 @@
+/*
+*   panelTilt.osl by Geoff Pedder
+*   tilts the normal of each panel by a small random amount, driven by a 0 to 1
+*   random value per panel ( a shape id, a random colour from a cell texture, etc )
+*
+*   the random value picks both the tilt direction and how far it leans, so every
+*   panel catches the light slightly differently, which breaks up large flat areas
+*   in the specular.
+*
+*   resultTangent is a tangent space normal map colour ( 0.5, 0.5, 1 is flat ), for a
+*   normal map node. resultNormal is the same tilt as a shading normal, which can go
+*   straight into a surface shader's normal input.
+*/
+
+shader panelTilt
+[[
+    string help = "Random per-panel normal tilt from a 0 to 1 input, for specular variation"
+]]
+(
+
+float input = 0 [[
+    string label = "Input",
+    string help = "Random value between 0 and 1, the same across each panel"
+]],
+
+float maxAngle = 2 [[
+    string label = "Max Angle",
+    string help = "Largest tilt away from the surface normal, in degrees",
+    float min = 0,
+    float max = 45
+]],
+
+float minAngle = 0 [[
+    string label = "Min Angle",
+    string help = "Smallest tilt, raise it so no panel stays perfectly flat",
+    float min = 0,
+    float max = 45
+]],
+
+float seed = 0 [[
+    string label = "Seed",
+    string help = "Changes the tilts while keeping the same input"
+]],
+
+output color resultTangent = color( 0.5, 0.5, 1 ),
+output normal resultNormal = 0,
+)
+
+{
+    // two independent randoms from the one input
+    float r1 = hashnoise( point( input * 1000, seed, 1 ) );
+    float r2 = hashnoise( point( input * 1000, seed, 2 ) );
+
+    // tilt direction around the normal and amount, sqrt spreads the tilts evenly over the cone
+    float azimuth = r1 * M_2PI;
+    float tilt = radians( mix( minAngle, maxAngle, sqrt( r2 ) ) );
+
+    float st = sin( tilt );
+    vector t = vector( st * cos( azimuth ), st * sin( azimuth ), cos( tilt ) );
+
+    resultTangent = color( t * 0.5 + 0.5 );
+
+    // same tilt in shading space, using a tangent frame built from the u direction
+    vector Nf = normalize( N );
+    vector T = dPdu - dot( dPdu, Nf ) * Nf;
+    if ( length( T ) < 1e-8 ) {
+        T = abs( Nf[0] ) < 0.9 ? cross( Nf, vector( 1, 0, 0 ) ) : cross( Nf, vector( 0, 1, 0 ) );
+    }
+    T = normalize( T );
+    vector B = cross( Nf, T );
+
+    resultNormal = normalize( T * t[0] + B * t[1] + Nf * t[2] );
+}
