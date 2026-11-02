@@ -1,0 +1,317 @@
+/*
+*   phasorNoise.osl by Geoff Pedder
+*   based on the paper "Procedural Phasor Noise" by Tricard, Efremov, Zanni, Neyret,
+*   Martinez and Lefebvre, ACM Transactions on Graphics 38(4), SIGGRAPH 2019
+*   https://hal.inria.fr/hal-02118508
+*
+*   Gabor kernels are scattered over a grid and summed as complex phasors. The pattern
+*   is a periodic profile of the summed phase, so it keeps full contrast everywhere,
+*   where Gabor noise fades out wherever kernels interfere. Each grid cell holds a number
+*   of kernels whose radius equals the cell size, so only the neighbouring cells
+*   (3x3 in 2D, 3x3x3 in 3D) contribute.
+*/
+
+#define PROFILE_SINE     0
+#define PROFILE_SAWTOOTH 1
+#define PROFILE_TRIANGLE 2
+#define PROFILE_PULSE    3
+#define PROFILE_GABOR    4
+
+// truncated gaussian, windowed so it reaches exactly zero at the kernel radius
+// ( d2 is the squared distance in cell units ) and leaves no seams at cell edges
+float kernelFalloff( float d2 ){
+    if ( d2 >= 1 ) return 0;
+    float w = 1 - d2;
+    return exp( -3 * d2 ) * w * w;
+}
+
+vector rotateAbout( vector v, float angle, vector axis ){
+    if ( angle == 0 ) return v;
+    return vector( rotate( point( v ), angle, point( 0 ), point( axis ) ) );
+}
+
+// complex sum ( re, im ) of the gabor kernels around p, which is in cell units
+// freq is in waves per cell
+vector phasorSum( point p, int dims, float freq, vector dir, float jitter, int impulses, float seed ){
+    point cell = floor( p );
+    int nz = dims == 3 ? 1 : 0;
+    float re = 0;
+    float im = 0;
+    for ( int i = -1; i <= 1; i++ )
+    for ( int j = -1; j <= 1; j++ )
+    for ( int k = -nz; k <= nz; k++ ) {
+        point c = cell + vector( i, j, k );
+        for ( int n = 0; n < impulses; n++ ) {
+            float s = seed + 4 * n;
+            vector r = cellnoise( c, s );
+            if ( dims == 2 ) r[2] = 0;
+            vector x = p - ( c + r );
+            float g = kernelFalloff( dot( x, x ) );
+            if ( g == 0 ) continue;
+
+            float phi = cellnoise( c, s + 1 );
+            vector d = dir;
+            if ( jitter > 0 ) {
+                if ( dims == 2 ) {
+                    float rnd = cellnoise( c, s + 2 );
+                    d = rotateAbout( d, ( rnd - 0.5 ) * jitter * M_2PI, vector( 0, 0, 1 ) );
+                }
+                else {
+                    vector rnd = cellnoise( c, s + 2 );
+                    vector dj = mix( d, normalize( rnd * 2 - 1 ), jitter );
+                    if ( length( dj ) > 1e-4 ) d = normalize( dj );
+                }
+            }
+            float a = M_2PI * ( freq * dot( d, x ) + phi );
+            re += g * cos( a );
+            im += g * sin( a );
+        }
+    }
+    return vector( re, im, 0 );
+}
+
+float profileValue( int profile, float x, float pw ){
+    float t = x - floor( x );
+    if ( profile == PROFILE_SAWTOOTH ) return t;
+    if ( profile == PROFILE_TRIANGLE ) return 1 - abs( 2 * t - 1 );
+    if ( profile == PROFILE_PULSE ) return t < pw ? 1 : 0;
+    return 0.5 + 0.5 * sin( M_2PI * x );
+}
+
+// integral of the profile from 0 to x, for exact box filtering over the phase
+float profileIntegral( int profile, float x, float pw ){
+    float n = floor( x );
+    float t = x - n;
+    if ( profile == PROFILE_SAWTOOTH ) return 0.5 * n + 0.5 * t * t;
+    if ( profile == PROFILE_TRIANGLE ) return 0.5 * n + ( t < 0.5 ? t * t : 2 * t - t * t - 0.5 );
+    if ( profile == PROFILE_PULSE ) return pw * n + min( t, pw );
+    return 0.5 * x - cos( M_2PI * x ) / ( 4 * M_PI );
+}
+
+// profile averaged over [ x - h, x + h ], anti-aliases the stripes and also the
+// singularities where the phase spins quickly around points of zero intensity
+float profileFiltered( int profile, float x, float h, float pw ){
+    if ( h < 1e-4 ) return profileValue( profile, x, pw );
+    return ( profileIntegral( profile, x + h, pw ) - profileIntegral( profile, x - h, pw ) ) / ( 2 * h );
+}
+
+shader phasorNoise
+[[
+    string help = "Phasor noise, stripes that bend and branch while keeping full contrast"
+]]
+(
+
+point inManifold = P [[
+    string label = "Input Manifold",
+    string help = "Where the noise is evaluated, connect a manifold or leave it as P"
+]],
+
+string space = "object" [[
+    string label = "Space",
+    string widget = "popup",
+    string options = "object|world|common",
+    string help = "The space that the manifold, direction and sizes are measured in",
+    int connectable = 0
+]],
+
+int dimensions = 3 [[
+    string label = "Dimensions",
+    string widget = "mapper",
+    string options = "2D Flat:2|3D:3",
+    string help = "2D Flat ignores Z, for ground planes and uv-like inputs",
+    int connectable = 0
+]],
+
+float scale = 1 [[
+    string label = "Scale",
+    string help = "Overall size of the pattern. Scales frequency and kernel size together, so 2 makes everything twice as large",
+    float min = 0
+]],
+
+float frequency = 4 [[
+    string label = "Frequency",
+    string help = "Waves per unit along the wave direction"
+]],
+
+float kernelSize = 0.5 [[
+    string label = "Kernel Size",
+    string help = "Radius of each kernel and the grid cell size. Larger kernels give longer, more coherent stripes",
+    int connectable = 0
+]],
+
+int impulses = 4 [[
+    string label = "Impulses",
+    string help = "Kernels per grid cell. More gives a denser, smoother field at linear cost",
+    int min = 1,
+    int max = 16,
+    int connectable = 0
+]],
+
+vector direction = vector( 1, 0, 0 ) [[
+    string label = "Direction",
+    string help = "Direction the waves travel in, the stripes run across it"
+]],
+
+float rotation = 0 [[
+    string label = "Rotation",
+    string help = "Rotates the direction in degrees, about the surface normal in 3D or Z in 2D",
+    float min = -180,
+    float max = 180
+]],
+
+float directionJitter = 0 [[
+    string label = "Direction Jitter",
+    string help = "Randomises each kernel's direction, 1 is fully random",
+    float min = 0,
+    float max = 1
+]],
+
+int alongSurface = 1 [[
+    string label = "Along Surface",
+    string widget = "checkBox",
+    string help = "3D only, projects the direction onto the surface so stripes don't run edge-on",
+    int connectable = 0
+]],
+
+float phaseOffset = 0 [[
+    string label = "Phase Offset",
+    string help = "Shifts the stripes along the waves, animate it for a flowing effect"
+]],
+
+int profile = 0 [[
+    string label = "Profile",
+    string widget = "mapper",
+    string options = "Sine:0|Sawtooth:1|Triangle:2|Pulse:3|Gabor:4",
+    string help = "Wave shape applied to the phase. Gabor shows classic gabor noise for comparison",
+    int connectable = 0
+]],
+
+float pulseWidth = 0.5 [[
+    string label = "Pulse Width",
+    string help = "Pulse profile only, the fraction of each wave that is on",
+    float min = 0,
+    float max = 1
+]],
+
+float soften = 0 [[
+    string label = "Soften",
+    string help = "Blends towards the average where kernels cancel out, hiding the pinched points of the field. Around 0.05 to 0.15 works well",
+    float min = 0
+]],
+
+int octaves = 1 [[
+    string label = "Octaves",
+    int min = 1,
+    int max = 8,
+    int connectable = 0
+]],
+
+float lacunarity = 2 [[
+    string label = "Lacunarity",
+    string help = "Frequency and kernel size scale per octave",
+    int connectable = 0
+]],
+
+float gain = 0.5 [[
+    string label = "Gain",
+    string help = "Weight of each successive octave"
+]],
+
+float octaveRotation = 0 [[
+    string label = "Octave Rotation",
+    string help = "Extra direction rotation per octave in degrees",
+    float min = -180,
+    float max = 180
+]],
+
+float seed = 0 [[
+    string label = "Seed"
+]],
+
+int antialias = 1 [[
+    string label = "Antialias",
+    string widget = "checkBox",
+    int connectable = 0
+]],
+
+color colorMin = 0 [[
+    string label = "Color Min"
+]],
+
+color colorMax = 1 [[
+    string label = "Color Max"
+]],
+
+float floatMin = 0 [[
+    string label = "Float Min"
+]],
+
+float floatMax = 1 [[
+    string label = "Float Max"
+]],
+
+output color result = 0,
+output float resultF = 0,
+output float resultPhase = 0,
+output float resultIntensity = 0,
+)
+
+{
+    int dims = dimensions == 2 ? 2 : 3;
+    point Q = transform( space, inManifold ) / max( scale, 1e-6 );
+    vector D = direction;
+    vector axis = vector( 0, 0, 1 );
+    if ( dims == 2 ) {
+        Q[2] = 0;
+        D[2] = 0;
+    }
+    else {
+        axis = normalize( transform( space, N ) );
+        if ( alongSurface ) D -= dot( D, axis ) * axis;
+        if ( length( D ) < 1e-4 ) D = transform( space, dPdu );
+    }
+    D = normalize( D );
+    D = rotateAbout( D, radians( rotation ), axis );
+
+    // expected phasor magnitude, so intensity and soften don't depend on impulses
+    float norm = sqrt( max( 1, impulses ) * ( dims == 3 ? 0.18 : 0.31 ) );
+
+    float average = profile == PROFILE_PULSE ? pulseWidth : 0.5;
+    float value = 0;
+    float wsum = 0;
+    float w = 1;
+    float size = max( kernelSize, 1e-6 );
+    float freq = frequency;
+
+    for ( int o = 0; o < octaves; o++ ) {
+        vector d = rotateAbout( D, radians( octaveRotation * o ), axis );
+        vector ps = phasorSum( Q / size, dims, freq * size, d, directionJitter, impulses, seed + 37 * o );
+        float intensity = length( ps ) / norm;
+        float x = atan2( ps[1], ps[0] ) / M_2PI + phaseOffset;
+
+        float v;
+        if ( profile == PROFILE_GABOR ) {
+            v = clamp( 0.5 + 0.25 * ps[0] / norm, 0, 1 );
+        }
+        else {
+            float h = antialias ? min( 0.5 * filterwidth( x ), 1 ) : 0;
+            v = profileFiltered( profile, x, h, pulseWidth );
+            if ( soften > 0 ) v = mix( v, average, exp( -intensity / soften ) );
+        }
+
+        // phase and intensity of the first octave, for driving other effects
+        if ( o == 0 ) {
+            resultPhase = x - floor( x );
+            resultIntensity = intensity;
+        }
+        value += w * v;
+        wsum += w;
+        w *= gain;
+        freq *= lacunarity;
+        size /= lacunarity;
+    }
+
+    value /= max( wsum, 1e-6 );
+    resultF = mix( floatMin, floatMax, value );
+    result = mix( colorMin, colorMax, value );
+}
