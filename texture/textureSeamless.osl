@@ -2,15 +2,51 @@
 *   textureSeamless.osl by Geoff Pedder
 *   ported from GLSL example by Fabrice Neyret https://www.shadertoy.com/view/MdyfDV
 *   from paper https://hal.inria.fr/hal-01824773
+*   with blending improvements from Burley 2019, On Histogram-preserving Blending
+*   for Randomized Texture Tiling https://jcgt.org/published/0008/04/02/
+*
+*   exponentiated weights sharpen the blend between tiles to reduce ghosting, and
+*   contrast is restored with Burley's soft-clipping operator instead of a hard
+*   clip, so values roll off smoothly instead of flattening at 0 and 1. contrast
+*   can be restored on luminance only, which avoids colour shifts in the blends.
+*
+*   the papers also gaussianize the texture before blending. that needs a lookup
+*   table built from the texture, so it isn't done here, and the soft clip is
+*   applied to the raw texture values around their mean instead.
 */
 
 float fract( float input ){
     return input - floor( input );
 }
 
-color ctex ( string filename, float texScale, vector uv, vector cell, vector offsets, color m ){
-	vector randcell = noise( "hash", cell + offsets );
-	return texture( filename, ( uv[0] / texScale ) - randcell[0], ( uv[1] / texScale ) - randcell[1], "wrap", "periodic") - m;
+color ctex ( string filename, float texScale, vector uv, vector cell, vector offsets ){
+    vector randcell = noise( "hash", cell + offsets );
+    return texture( filename, ( uv[0] / texScale ) - randcell[0], ( uv[1] / texScale ) - randcell[1], "wrap", "periodic" );
+}
+
+// Burley's soft-clipping contrast operator ( equation 4 ) for x <= 0.5,
+// linear with slope 1 / W through the middle, rolling off smoothly to 0
+float softClipLower( float x, float W ){
+    if ( x >= ( 2 - W ) / 4 ) return ( x - 0.5 ) / W + 0.5;
+    if ( W >= 2.0 / 3.0 ) {
+        float t = x / ( 2 - W );
+        return 8 * ( 1 / W - 1 ) * t * t + ( 3 - 2 / W ) * t;
+    }
+    if ( x >= ( 2 - 3 * W ) / 4 ) {
+        float d = x - ( 2 - 3 * W ) / 4;
+        return d * d / ( W * W );
+    }
+    return 0;
+}
+
+// restores the contrast lost by blending, around the mean instead of 0.5. each side
+// of the mean is remapped to half the range so the operator stays symmetric
+float restoreContrast( float x, float mean, float W ){
+    float m = clamp( mean, 1e-4, 1 - 1e-4 );
+    float t = x <= m ? 0.5 * x / m : 0.5 + 0.5 * ( x - m ) / ( 1 - m );
+    t = clamp( t, 0, 1 );
+    float s = t <= 0.5 ? softClipLower( t, W ) : 1 - softClipLower( 1 - t, W );
+    return s <= 0.5 ? 2 * s * m : m + ( s - 0.5 ) * 2 * ( 1 - m );
 }
 
 shader textureSeamless
@@ -38,6 +74,22 @@ float texScale = 4 [[
     int connectable = 0
 ]],
 
+float blendExponent = 4 [[
+    string label = "Blend Exponent",
+    string help = "Sharpens the blend between tiles to reduce ghosting. 1 is the original soft blend, 4 suits most textures, 8 and above starts to show the tile edges",
+    float min = 1,
+    float max = 16,
+    int connectable = 0
+]],
+
+string contrast = "rgb" [[
+    string label = "Contrast Restore",
+    string widget = "popup",
+    string options = "none|rgb|luminance",
+    string help = "Restores the contrast lost in the blends. rgb works per channel, luminance only restores brightness contrast, which avoids colour shifts in some textures. none is a plain linear blend",
+    int connectable = 0
+]],
+
 int showGrid = 0 [[
     string label = "Display Grid",
     string widget = "checkBox",
@@ -56,38 +108,64 @@ output color result = 0,
 
 {
     // construct matrix for skew
-    matrix M0 = matrix(1);
+    matrix M0 = matrix( 1 );
     M0[1][0] = -0.577353;
     M0[1][1] = 1.1547077;
-
 
     // create cell uv's
     point _uv = point( u, v, 0 ) * scale;
     if ( isconnected( inManifold ) ) _uv = inManifold * scale;
     point _F = transform( M0, _uv );
-    vector h = vector(  fract( _F[0] ), fract( _F[1] ), 0 );
+    vector h = vector( fract( _F[0] ), fract( _F[1] ), 0 );
     h[2] = 1 - h[0] - h[1];
 
     // cell id
     vector _I = floor( _F );
- 
+
+    // texture mean from the smallest mip level
     color m = texture( filename, _uv[0], _uv[1], "width", 99, "wrap", "periodic" );
 
+    // the three tiles at the corners of this triangle and their barycentric weights
     vector W;
-    if ( h[2] > 0 ) result = ( W[0] = h[2] ) * ctex( filename, texScale, _uv, _I, point( 0, 0, 0 ), m )
-                           + ( W[1] = h[1] ) * ctex( filename, texScale, _uv, _I, point( 0, 1, 0 ), m )
-                           + ( W[2] = h[0] ) * ctex( filename, texScale, _uv, _I, point( 1, 0, 0 ), m );
-    else result = ( W[0] = -h[2] ) * ctex( filename, texScale, _uv, _I, point( 1, 1, 0 ), m )
-                + ( W[1] = 1.0 - h[1] ) * ctex( filename, texScale, _uv, _I, point( 1, 0, 0 ), m )
-                + ( W[2] = 1.0 - h[0] ) * ctex( filename, texScale, _uv, _I, point( 0, 1, 0 ), m );
+    color c0, c1, c2;
+    if ( h[2] > 0 ) {
+        W = vector( h[2], h[1], h[0] );
+        c0 = ctex( filename, texScale, _uv, _I, point( 0, 0, 0 ) );
+        c1 = ctex( filename, texScale, _uv, _I, point( 0, 1, 0 ) );
+        c2 = ctex( filename, texScale, _uv, _I, point( 1, 0, 0 ) );
+    }
+    else {
+        W = vector( -h[2], 1.0 - h[1], 1.0 - h[0] );
+        c0 = ctex( filename, texScale, _uv, _I, point( 1, 1, 0 ) );
+        c1 = ctex( filename, texScale, _uv, _I, point( 1, 0, 0 ) );
+        c2 = ctex( filename, texScale, _uv, _I, point( 0, 1, 0 ) );
+    }
 
-    // contrast preservation
-    result = m + result / length( W );
-    result = clamp( result, 0, 1 );
+    // exponentiated weights ( Burley equation 5 ), renormalized to sum to 1
+    vector Wp = vector( pow( max( W[0], 0 ), blendExponent ), pow( max( W[1], 0 ), blendExponent ), pow( max( W[2], 0 ), blendExponent ) );
+    Wp /= max( Wp[0] + Wp[1] + Wp[2], 1e-8 );
+
+    // linear blend, then the variance scale factor for contrast restoration
+    result = Wp[0] * c0 + Wp[1] * c1 + Wp[2] * c2;
+    float Wv = max( length( Wp ), 1e-4 );
+
+    if ( contrast == "rgb" ) {
+        for ( int i = 0; i < 3; i++ ) result[i] = restoreContrast( result[i], m[i], Wv );
+    }
+    else if ( contrast == "luminance" ) {
+        // JPEG YCbCr, blending is linear so the chroma is already right, only Y needs restoring
+        float Y = 0.299 * result[0] + 0.587 * result[1] + 0.114 * result[2];
+        float Cb = -0.168736 * result[0] - 0.331264 * result[1] + 0.5 * result[2];
+        float Cr = 0.5 * result[0] - 0.418688 * result[1] - 0.081312 * result[2];
+        float mY = 0.299 * m[0] + 0.587 * m[1] + 0.114 * m[2];
+        Y = restoreContrast( Y, mY, Wv );
+        result = color( Y + 1.402 * Cr, Y - 0.344136 * Cb - 0.714136 * Cr, Y + 1.772 * Cb );
+        result = clamp( result, 0, 1 );
+    }
 
     // display grid for debug and scaling feedback
     if ( showGrid ) {
         float fw = filterwidth( _uv[1] ) * 2.0;
-        result= mix( result, color( 1, 0, 0 ), 1 - smoothstep( fw, -fw, min( W[0], min( W[1], W[2] ) ) ) );
+        result = mix( result, color( 1, 0, 0 ), 1 - smoothstep( fw, -fw, min( W[0], min( W[1], W[2] ) ) ) );
     }
 }
